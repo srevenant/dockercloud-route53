@@ -1,0 +1,3 @@
+docker run -e=CONFIG="$CONFIG" \
+       --name=${DOCKER_NAME} \
+       ${DOCKER_IMAGE}

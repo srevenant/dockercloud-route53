@@ -1,0 +1,33 @@
+{
+  "sensitive": {
+    "config": {
+      "debug": false,
+      "dockercloud": {
+        "poll_interval_seconds": 60,
+        "user": "docker-user",
+        "pass": "docker-apikey",
+        "org": "docker-org (optional)",
+        "url": {
+          "service": {
+            "vers": "v1",
+            "path": "/services"
+          },
+          "container": {
+            "vers": "v1",
+            "path": "/container"
+          }
+        }
+      },
+      "aws": {
+        "connect": {
+          "aws_access_key_id": "aws key",
+          "aws_secret_access_key": "aws secret"
+        },
+        "r53": {
+          "zone_id": "r53zoneid",
+          "domain": "domain.com."
+        }
+      }
+    }
+  }
+}
