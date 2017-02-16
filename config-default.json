@@ -25,7 +25,8 @@
         },
         "r53": {
           "zone_id": "r53zoneid",
-          "domain": "domain.com."
+          "domain": "domain.com.",
+          "ttl": 60
         }
       }
     }

@@ -60,7 +60,7 @@ class DockerCloud(rfx.Base):
 
     ###########################################################################
     def reset_stats(self):
-        self.stats = dictlib.Obj(services=0, changed=0, started=time.time())
+        self.stats = dictlib.Obj(services=0, changes=0, started=time.time())
 
     ###########################################################################
     def start_agent(self):
@@ -139,14 +139,12 @@ class DockerCloud(rfx.Base):
                 if zone.get(name,{}).get(rtype,{}).get(value):
                     continue
 
-                self.stats.changed += 1
-                self.NOTIFY("Route53 " + type + " " + name + " " + rtype + " " + value)
                 self._r53_do({
                     'Action': type,
                         'ResourceRecordSet': {
                             'Name': name + '.' + self.aws.r53.domain,
                             'Type': rtype.upper(),
-                            'TTL': 300,
+                            'TTL': self.aws.r53.ttl,
                             'ResourceRecords': [{
                                'Value': value
                             }]
@@ -157,7 +155,7 @@ class DockerCloud(rfx.Base):
                         'ResourceRecordSet': {
                             'Name': name + '.' + self.aws.r53.domain,
                             'Type': 'TXT',
-                            'TTL': 300,
+                            'TTL': self.aws.r53.ttl,
                             'ResourceRecords': [{
                                'Value': '"v=dca"'
                             }]
@@ -166,15 +164,13 @@ class DockerCloud(rfx.Base):
 
         if delete:
             for value in starting:
-                self.stats.changed += 1
-                self.NOTIFY("Route53 DELETE " + name + " " + rtype + " " + value)
                 record = zone[name][rtype][value]
                 self._r53_do({
                     'Action': 'DELETE',
                         'ResourceRecordSet': {
                             'Name': name + '.' + self.aws.r53.domain,
                             'Type': rtype,
-                            'TTL': record.get('TTL', 300),
+                            'TTL': record.get('TTL', self.aws.r53.ttl),
                             'ResourceRecords': [{
                                'Value': value
                             }]
@@ -185,7 +181,7 @@ class DockerCloud(rfx.Base):
                         'ResourceRecordSet': {
                             'Name': name + '.' + self.aws.r53.domain,
                             'Type': 'TXT',
-                            'TTL': 300,
+                            'TTL': self.aws.r53.ttl,
                             'ResourceRecords': [{
                                'Value': '"v=dca"'
                             }]
@@ -195,8 +191,19 @@ class DockerCloud(rfx.Base):
         return True
 
     def _r53_do(self, change):
+
         try:
-            result = self.aws.r53c.change_resource_record_sets(
+            values = list()
+            for val in change['ResourceRecordSet']['ResourceRecords']:
+                values.append(val['Value'])
+            self.NOTIFY("Route53 {} {} {} {}"
+                        .format(change['Action'],
+                                change['ResourceRecordSet']['Name'],
+                                change['ResourceRecordSet']['Type'],
+                                " ".join(values)
+                                ))
+            self.stats.changes += 1
+            return self.aws.r53c.change_resource_record_sets(
                 HostedZoneId= self.aws.r53.zone_id,
                 ChangeBatch= {'Changes': [change]}
             )
@@ -233,7 +240,9 @@ class DockerCloud(rfx.Base):
         )
         self.aws['r53zone'] = zone = dict()
         strip_name_rx = re.compile("\\." + self.aws.r53.domain.replace(".", "\\.") + "$")
+        next_token = None
         for record_set in r53_iterator:
+            print("keys={}".format(record_set.keys()))
             for record in record_set['ResourceRecordSets']:
                 rname = record['Name']
                 short_name = strip_name_rx.sub('', rname)
@@ -250,6 +259,7 @@ class DockerCloud(rfx.Base):
                         self._r53_zone_add(short_name, record['Type'], value, record)
 
             if record_set.get('IsTruncated'):
+                print("iterator={}".format(r53_iterator))
                 r53_iterator = r53_paginator.paginate(
                     HostedZoneId=self.aws.r53.zone_id,
                     PaginationConfig={
@@ -377,45 +387,53 @@ class DockerCloud(rfx.Base):
                 self.DEBUG("ignoring bad service name: " + name)
 
             dc_names2.add(name)
-            ips = list()
+            ips = set()
             # a list of tuples with name:ip:port
             for addr in services[name]:
-                ips.append(addr[1])
+                ips.add(addr[1])
 
             cluster = cluster_rx.sub('', name)
             dc_names2.add(cluster)
             if not clusters.get(cluster):
-                clusters[cluster] = ips
+                clusters[cluster] = set(ips)
             else:
                 for ip in ips:
-                    clusters[cluster].append(ip)
+                    clusters[cluster].add(ip)
 
-            self.r53_update(name, "A", ips)
+            self.r53_update(name, "A", list(ips))
 
-## BJG: clusters need more work
-#        print(clusters)
-#        for cluster in clusters:
-#            # should pull the current state of cluster and get a set difference
-#            vals = list()
-#            for ip in clusters[cluster]:
-#                vals.append({'Value': ip})
-#
-#            self._r53_do({
-#                'Action': "UPSERT",
-#                    'ResourceRecordSet': {
-#                        'Name': cluster + '.' + self.aws.r53.domain,
-#                        'Type': "A",
-#                        'TTL': 300,
-#                        'ResourceRecords': vals
-#                    }
-#                })
-##            self.r53_update(cluster, "A", clusters[cluster], delete=False, type="CREATE")
+        for cluster in clusters:
+            # should pull the current state of cluster and get a set difference
+            vals = list()
+            x=0
+            for ip in sorted(clusters[cluster]):
+                vals.append({'Value': ip})
+                # we also want to create a normalized numbered name,
+                # because docker cloud picks random numbers...
+                x += 1
+                nname = "{}-{}n".format(cluster, x)
+                dc_names2.add(nname)
+
+                self.r53_update(nname, "A", [ip])
+
+            current = set(zone.get(cluster,{}).get("A",{}).keys())
+            if not current.difference(clusters[cluster]):
+                continue
+            self._r53_do({
+                'Action': "UPSERT",
+                    'ResourceRecordSet': {
+                        'Name': cluster + '.' + self.aws.r53.domain,
+                        'Type': "A",
+                        'TTL': self.aws.r53.ttl,
+                        'ResourceRecords': vals
+                    }
+                })
 
         for name in dc_names1.difference(dc_names2):
             self.r53_update(name, "A", [], add=False) # delete only
 
         self.stats['duration'] = time.time() - self.stats.started
-        self.DEBUG("Update finished, services={services} changed={changed} duration=\"{duration:0.2f} seconds\"".format(**self.stats))
+        self.DEBUG("Update finished, services={services} changes={changes} duration=\"{duration:0.2f} seconds\"".format(**self.stats))
 
 def main():
     cm = DockerCloud()
