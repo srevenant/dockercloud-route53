@@ -234,16 +234,17 @@ class DockerCloud(rfx.Base):
         self.r53_init()
         self.aws['r53_dca'] = set()
 
+        # goofy boto pagination and iterator gets us away from having to do it ourself
         r53_paginator = self.aws.r53c.get_paginator('list_resource_record_sets')
         r53_iterator = r53_paginator.paginate(
             HostedZoneId=self.aws.r53.zone_id,
         )
         self.aws['r53zone'] = zone = dict()
         strip_name_rx = re.compile("\\." + self.aws.r53.domain.replace(".", "\\.") + "$")
-        next_token = None
+        count = 0
         for record_set in r53_iterator:
-            print("keys={}".format(record_set.keys()))
             for record in record_set['ResourceRecordSets']:
+                count += 1
                 rname = record['Name']
                 short_name = strip_name_rx.sub('', rname)
                 record['ShortName'] = short_name
@@ -258,16 +259,7 @@ class DockerCloud(rfx.Base):
 
                         self._r53_zone_add(short_name, record['Type'], value, record)
 
-            if record_set.get('IsTruncated'):
-                print("iterator={}".format(r53_iterator))
-                r53_iterator = r53_paginator.paginate(
-                    HostedZoneId=self.aws.r53.zone_id,
-                    PaginationConfig={
-                        'StartingToken': r53_iterator['NextToken']
-                    }
-                )
-            else:
-                break
+        self.DEBUG("Route53 Loaded {} records, filtered to {}".format(count, len(zone)))
 
         return zone
 

@@ -1,0 +1,15 @@
+#!/bin/sh
+
+base=$(hostname)-p3
+
+if [ -f $base/bin/activate ]; then
+    source $base/bin/activate
+else
+    echo "Rebuild? [yes]"
+    read
+    rm -rf $base
+    virtualenv -p $(which python3) $base
+    source $base/bin/activate
+    pip3 install -r requirements.txt
+fi
+
