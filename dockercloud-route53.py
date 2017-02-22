@@ -38,6 +38,12 @@ import logging
 boto3.set_stream_logger('boto3.resources', logging.DEBUG)
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
+def get_record_vals(record):
+    vals = set()
+    for value in record['ResourceRecords']:
+        vals.add(value['Value'])
+    return vals
+
 ###############################################################################
 # pylint: disable=too-many-instance-attributes
 class DockerCloud(rfx.Base):
@@ -57,6 +63,23 @@ class DockerCloud(rfx.Base):
         self.dc = dictlib.Obj()
         self.lock = threading.Lock()
         self.timestamp = True
+
+    # determine if the zone record is safe to insert a dca record
+    def name_is_changeable(self, name):
+        zone = self.aws.r53zone
+        record = zone.get(name, {})
+        if not record:
+            return True # it doesn't exist, thus we can insert it
+        txt = record.get('TXT', {})
+        if not txt:
+            self.alert("Name collision! " + name + " defined and not txt:v=dca, not updating")
+            return False # must be something else
+        for key in txt:
+            for value in txt[key]['ResourceRecords']:
+                if "v=dca" in value['Value']:
+                    return True # one of ours
+        self.alert("Name collision! " + name + " defined and not txt:v=dca, not updating")
+        return False
 
     ###########################################################################
     def reset_stats(self):
@@ -121,26 +144,30 @@ class DockerCloud(rfx.Base):
             self.aws.r53c = boto3.client('route53', **self.aws.connect)
 
     ###########################################################################
-    def r53_update(self, name, rtype, values, add=True, delete=True, type="UPSERT"):
+    def r53_update(self, name, rtype, values, upsert=True, delete=True):
         self.r53_init()
 
+        if not self.name_is_changeable(name):
+            return
+
+        zone = self.aws.r53zone
         aws_changes = list()
         zone_add = list()
         zone_del = list()
         name = name.lower()
         rtype = rtype.upper()
-        zone = self.aws.r53zone
         starting = set(zone.get(name,{}).get(rtype,{}).keys())
+        timestamp = str(time.time())
 
-        if add:
+        if upsert:
             for value in values:
                 value = value.lower()
-                starting.discard(value)
+                #starting.discard(value)
                 if zone.get(name,{}).get(rtype,{}).get(value):
                     continue
 
                 self._r53_do({
-                    'Action': type,
+                    'Action': 'UPSERT',
                         'ResourceRecordSet': {
                             'Name': name + '.' + self.aws.r53.domain,
                             'Type': rtype.upper(),
@@ -157,45 +184,89 @@ class DockerCloud(rfx.Base):
                             'Type': 'TXT',
                             'TTL': self.aws.r53.ttl,
                             'ResourceRecords': [{
-                               'Value': '"v=dca"'
+                                                  # add timestamps later for aged deletes
+                                                  # this breaks our blind delete otherwise
+                               'Value': '"v=dca"' # ;ts=' + timestamp + '"'
                             }]
                         }
                     })
+            starting = [] # because we upserted it'll clear the values
 
         if delete:
             for value in starting:
                 record = zone[name][rtype][value]
-                self._r53_do({
-                    'Action': 'DELETE',
-                        'ResourceRecordSet': {
-                            'Name': name + '.' + self.aws.r53.domain,
-                            'Type': rtype,
-                            'TTL': record.get('TTL', self.aws.r53.ttl),
-                            'ResourceRecords': [{
-                               'Value': value
-                            }]
-                        }
-                    })
-                self._r53_do({
-                    'Action': 'DELETE',
-                        'ResourceRecordSet': {
-                            'Name': name + '.' + self.aws.r53.domain,
-                            'Type': 'TXT',
-                            'TTL': self.aws.r53.ttl,
-                            'ResourceRecords': [{
-                               'Value': '"v=dca"'
-                            }]
-                        }
-                    })
+                # pull original value
+                self._r53_delete(name)
+#                print("eet goes " + name)
+#                if self._r53_do({
+#                    'Action': 'DELETE',
+#                        'ResourceRecordSet': {
+#                            'Name': name + '.' + self.aws.r53.domain,
+#                            'Type': rtype,
+#                            'TTL': record.get('TTL', self.aws.r53.ttl),
+#                            'ResourceRecords': [{
+#                               'Value': value
+#                            }]
+#                        }
+#                    }):
+#                    self._r53_do({
+#                        'Action': 'DELETE',
+#                            'ResourceRecordSet': {
+#                                'Name': name + '.' + self.aws.r53.domain,
+#                                'Type': 'TXT',
+#                                'TTL': self.aws.r53.ttl,
+#                                'ResourceRecords': [{
+#                                   'Value': '"v=dca"'
+#                                }]
+#                            }
+#                        })
 
         return True
 
-    def _r53_do(self, change):
+    ###########################################################################
+    def _r53_delete(self, name):
+        zone = self.aws.r53zone
+        recs = zone.get(name, {}).get("A", {})
+        if not recs:
+            return
 
+        # get the first in the set
+        key = list(recs.keys())[0]
+        record = recs[key]
+        vals = record['ResourceRecords']
+
+        if self._r53_do({
+            'Action': 'DELETE',
+                'ResourceRecordSet': {
+                    'Name': name + '.' + self.aws.r53.domain,
+                    'Type': "A",
+                    'TTL': record.get('TTL', self.aws.r53.ttl),
+                    'ResourceRecords': vals
+                }
+            }):
+
+            # lookup the txt record for ttl and value
+            self._r53_do({
+                'Action': 'DELETE',
+                    'ResourceRecordSet': {
+                        'Name': name + '.' + self.aws.r53.domain,
+                        'Type': 'TXT',
+                        'TTL': self.aws.r53.ttl,
+                        'ResourceRecords': [{
+                           'Value': '"v=dca"'
+                        }]
+                    }
+                })
+
+    ###########################################################################
+    def _r53_do(self, change):
         try:
             values = list()
             for val in change['ResourceRecordSet']['ResourceRecords']:
-                values.append(val['Value'])
+                if isinstance(val['Value'], list):
+                    values = values + val['Value']
+                else:
+                    values.append(val['Value'])
             self.NOTIFY("Route53 {} {} {} {}"
                         .format(change['Action'],
                                 change['ResourceRecordSet']['Name'],
@@ -207,8 +278,17 @@ class DockerCloud(rfx.Base):
                 HostedZoneId= self.aws.r53.zone_id,
                 ChangeBatch= {'Changes': [change]}
             )
-        except:
-            self.NOTIFY("Error talking to Route53! " + traceback.format_exc())
+        except Exception as err:
+            strerr = str(err)
+            if "Tried to delete resource record set" in strerr and "but it was not found" in strerr:
+                return False
+            if "values provided do not match the current values" in strerr:
+                self.NOTIFY("Values do not match, cannot commit!")
+            else:
+                self.NOTIFY("Error committing to Route53!\n")
+                self.NOTIFY(traceback.format_exc())
+            self.NOTIFY("Change: {}".format(change))
+        return False
 
     ###########################################################################
     def _r53_zone_add(self, name, rtype, value, record):
@@ -293,7 +373,7 @@ class DockerCloud(rfx.Base):
                     cur.append((name, pip, port))
                     services[name] = cur
                 except Exception as err: # pylint: disable=broad-except
-                    self.message_team("Unable to process container: {} ({})".format(name, err))
+                    self.alert("Unable to process container: {} ({})".format(name, err))
                     self.NOTIFY("Traceback", traceback=traceback.format_exc())
     
         return services
@@ -329,7 +409,7 @@ class DockerCloud(rfx.Base):
         if res.status_code != 200:
             # alarm somehow
             msg = "Unable to query Docker Cloud! {}".format(res.status_code)
-            self.message_team(msg)
+            self.alert(msg)
             raise ValueError(msg)
 
         obj = res.json()
@@ -339,8 +419,9 @@ class DockerCloud(rfx.Base):
         return obj
 
     ###########################################################################
-    def message_team(self, msg):
+    def alert(self, msg):
         """Send a notification to appropriate channel"""
+        self.NOTIFY("ALERT: " + msg)
         return
 
         msg = "> " + self.service + " Docker Cloud: " + msg
@@ -392,12 +473,14 @@ class DockerCloud(rfx.Base):
                 for ip in ips:
                     clusters[cluster].add(ip)
 
-            self.r53_update(name, "A", list(ips))
+            self.r53_update(name, "A", list(ips), upsert=True, delete=False)
 
         for cluster in clusters:
             # should pull the current state of cluster and get a set difference
             vals = list()
             x=0
+
+            # normalized number name because -x can get out of order, baseline it to 1
             for ip in sorted(clusters[cluster]):
                 vals.append({'Value': ip})
                 # we also want to create a normalized numbered name,
@@ -406,23 +489,43 @@ class DockerCloud(rfx.Base):
                 nname = "{}-{}n".format(cluster, x)
                 dc_names2.add(nname)
 
-                self.r53_update(nname, "A", [ip])
+                self.r53_update(nname, "A", [ip], upsert=True, delete=False)
 
-            current = set(zone.get(cluster,{}).get("A",{}).keys())
-            if not current.difference(clusters[cluster]):
+            # safe to put in a cluster name?
+            clname = cluster + "-svc"
+            dc_names2.add(clname)
+            if not self.name_is_changeable(clname):
                 continue
-            self._r53_do({
+
+            cldata = zone.get(clname, {})
+            current = set(zone.get(clname,{}).get("A",{}).keys())
+
+            if not clusters[cluster].difference(current):
+                continue
+
+            if self._r53_do({
                 'Action': "UPSERT",
                     'ResourceRecordSet': {
-                        'Name': cluster + '.' + self.aws.r53.domain,
+                        'Name': clname + '.' + self.aws.r53.domain,
                         'Type': "A",
                         'TTL': self.aws.r53.ttl,
                         'ResourceRecords': vals
                     }
-                })
+                }):
+                self._r53_do({
+                    'Action': 'UPSERT',
+                        'ResourceRecordSet': {
+                            'Name': clname + '.' + self.aws.r53.domain,
+                            'Type': 'TXT',
+                            'TTL': self.aws.r53.ttl,
+                            'ResourceRecords': [{
+                               'Value': '"v=dca"'
+                            }]
+                        }
+                    })
 
         for name in dc_names1.difference(dc_names2):
-            self.r53_update(name, "A", [], add=False) # delete only
+            self._r53_delete(name)
 
         self.stats['duration'] = time.time() - self.stats.started
         self.DEBUG("Update finished, services={services} changes={changes} duration=\"{duration:0.2f} seconds\"".format(**self.stats))
@@ -433,4 +536,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
